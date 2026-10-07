@@ -40,6 +40,8 @@ for (const key of [
   });
 }
 (globalThis as Record<string, unknown>).global = globalThis;
+// Required for React's act() to be considered supported in this environment.
+(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 win.matchMedia = ((query: string) => ({
   matches: false,
   media: query,
@@ -191,7 +193,10 @@ const check = (name: string, ok: boolean, detail = "") => {
       { id: "col1", title: "Plot Point" },
       { id: "col2", title: "Theme" },
     ],
-    cells: { "ch1:col1": "the letter", "ch2:col2": "inheritance as debt" },
+    cells: {
+      "ch1:col1": [{ id: "cardA", content: "the letter" }],
+      "ch2:col2": [{ id: "cardB", content: "inheritance as debt" }],
+    },
   };
 
   const container = doc.createElement("div");
@@ -208,7 +213,13 @@ const check = (name: string, ok: boolean, detail = "") => {
   });
 
   const cards = Array.from(doc.querySelectorAll('[role="button"]'));
-  check("PlotGrid renders every card slot", cards.length === 4, `${cards.length} slots`);
+  check("PlotGrid renders both existing cards", cards.length === 2, `${cards.length} cards`);
+  check(
+    "PlotGrid renders an add-card control per slot",
+    Array.from(doc.querySelectorAll("button")).filter((b) =>
+      b.getAttribute("aria-label")?.startsWith("Add a card to"),
+    ).length === 4,
+  );
   check(
     "PlotGrid renders the four default layers",
     doc.body.textContent?.includes("Plot Point") === true &&
@@ -218,6 +229,10 @@ const check = (name: string, ok: boolean, detail = "") => {
   check(
     "PlotGrid shows existing card text",
     doc.body.textContent?.includes("the letter") === true,
+  );
+  check(
+    "An empty slot shows the add-a-card control, not a blank card",
+    cards.every((card) => card.textContent?.trim().length !== 0),
   );
 
   // dragstart on card 1 → drop on card 4 (ch2 x col2): should swap the texts.
@@ -232,29 +247,52 @@ const check = (name: string, ok: boolean, detail = "") => {
     return event;
   };
 
-  if (cards.length === 4) {
+  if (cards.length >= 2) {
     await act(async () => {
       cards[0].dispatchEvent(makeDrag("dragstart"));
     });
     await act(async () => {
-      cards[3].dispatchEvent(makeDrag("dragover"));
-      cards[3].dispatchEvent(makeDrag("drop"));
+      cards[1].dispatchEvent(makeDrag("dragover"));
+      cards[1].dispatchEvent(makeDrag("drop"));
       cards[0].dispatchEvent(makeDrag("dragend"));
     });
-    const move = calls.find((c) => "fromChapterId" in c);
-    check("PlotGrid drop calls moveCell with from/to", move !== undefined, JSON.stringify(move));
+    const move = calls.find((c) => "cardId" in c);
+    check("PlotGrid drop calls moveCard with the dragged card", move !== undefined, JSON.stringify(move));
     check(
-      "moveCell targets the dropped-onto cell",
-      move?.fromChapterId === "ch1" &&
-        move?.fromColumnId === "col1" &&
+      "moveCard appends into the dropped-onto slot (no swap)",
+      move?.cardId === "cardA" &&
         move?.toChapterId === "ch2" &&
         move?.toColumnId === "col2",
       JSON.stringify(move),
     );
+    check(
+      "moveCard never mentions a swap/source slot",
+      move !== undefined && !("fromChapterId" in (move ?? {})),
+    );
   }
+
+  // “+ card” in an empty slot must create a card there, not swap anything.
+  calls.length = 0;
+  const addButtons = Array.from(doc.querySelectorAll("button")).filter((b) =>
+    b.getAttribute("aria-label")?.startsWith("Add a card to"),
+  );
+  await act(async () => {
+    addButtons[1]?.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  // addCard args: chapterId + columnId but no cardId/toChapterId.
+  const added = calls.find(
+    (c) => "chapterId" in c && !("cardId" in c) && !("toChapterId" in c),
+  );
+  check(
+    "Add-card button creates a card in that slot",
+    added !== undefined && added.chapterId === "ch1" && added.columnId === "col2",
+    JSON.stringify(calls),
+  );
 
   // Click-to-edit: a plain click must open the editor dialog.
   calls.length = 0;
+  await new Promise((resolve) => setTimeout(resolve, 400)); // clear drag click-guard
   await act(async () => {
     cards[1]?.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
   });
@@ -264,7 +302,7 @@ const check = (name: string, ok: boolean, detail = "") => {
   );
   check(
     "PlotGrid click opens the card editor with chapter/layer context",
-    dialogTitle.some((t) => t === "Chapter 1"),
+    dialogTitle.some((t) => t === "Chapter 2"),
     JSON.stringify(dialogTitle),
   );
 

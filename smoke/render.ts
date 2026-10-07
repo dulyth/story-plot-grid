@@ -48,7 +48,13 @@ const { MemoryRouter } = await server.ssrLoadModule("react-router");
     { id: "col3", title: "Invisible Layer" },
     { id: "col4", title: "Theme" },
   ],
-  cells: { "ch1:col1": "The letter arrives sealed in black wax.", "ch1:col2": "" },
+  cells: {
+    "ch1:col1": [
+      { id: "card1", content: "The letter arrives sealed in black wax." },
+      { id: "card2", content: "Second card in the same slot." },
+    ],
+    "ch1:col2": [{ id: "card3", content: "" }],
+  },
 };
 
 const cases = [
@@ -72,6 +78,14 @@ for (const testCase of cases) {
     const html = renderToString(
       createElement(MemoryRouter, { initialEntries: [testCase.route] }, createElement(Page, extraProps)),
     );
+    if (testCase.mod.includes("CellEditor")) {
+      // Radix dialog content mounts through a portal, which yields no server
+      // markup. Assert it renders without throwing; smoke/dom.ts exercises it.
+      console.log(
+        `OK   ${testCase.mod}  (portal, ${html.length} chars server-side; covered by smoke/dom.ts)`,
+      );
+      continue;
+    }
     if (html.length < 20) throw new Error(`suspiciously short output (${html.length} chars)`);
     console.log(`OK   ${testCase.mod}  (${html.length} chars)`);
   } catch (error) {

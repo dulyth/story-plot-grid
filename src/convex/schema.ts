@@ -51,11 +51,14 @@ const schema = defineSchema(
       order: v.number(),
     }).index("by_board", ["boardId"]),
 
+    // One document per card. A slot (chapter x column) may hold many cards,
+    // ordered by `order` within that slot.
     cells: defineTable({
       boardId: v.id("boards"),
       chapterId: v.id("chapters"),
       columnId: v.id("plotColumns"),
       content: v.string(),
+      order: v.optional(v.number()),
     })
       .index("by_chapter_column", ["chapterId", "columnId"])
       .index("by_board", ["boardId"]),

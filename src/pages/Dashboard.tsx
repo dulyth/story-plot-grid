@@ -44,8 +44,9 @@ export default function Dashboard() {
     );
   }
 
-  const filled = Object.values(board.cells).filter((c) => c.trim()).length;
-  const total = board.chapters.length * board.columns.length;
+  const allCards = Object.values(board.cells).flat();
+  const filled = allCards.filter((card) => card.content.trim()).length;
+  const total = allCards.length;
 
   return (
     <main className="min-h-screen bg-background">

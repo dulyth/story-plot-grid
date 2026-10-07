@@ -80,10 +80,18 @@ export const getBoard = query({
 
     chapters.sort((a, b) => a.order - b.order);
     plotColumns.sort((a, b) => a.order - b.order);
+    // Cards group into their slot, ordered within it. Legacy cards without an
+    // `order` fall back to 0 and keep creation order via the _creationTime
+    // tiebreak in the sort.
+    cells.sort(
+      (a, b) =>
+        (a.order ?? 0) - (b.order ?? 0) || a._creationTime - b._creationTime,
+    );
 
-    const cellMap: Record<string, string> = {};
+    const cellMap: Record<string, { id: Id<"cells">; content: string }[]> = {};
     for (const cell of cells) {
-      cellMap[`${cell.chapterId}:${cell.columnId}`] = cell.content;
+      const key = `${cell.chapterId}:${cell.columnId}`;
+      (cellMap[key] ??= []).push({ id: cell._id, content: cell.content });
     }
 
     return {
@@ -269,95 +277,99 @@ export const deleteColumn = mutation({
 });
 
 // ---------------------------------------------------------------------------
-// Cells (cards)
+// Cards (one document per card; a slot may hold many, ordered within it)
 // ---------------------------------------------------------------------------
 
-/** Upsert one card's text. Empty text deletes the card document. */
-export const setCell = mutation({
+/** Next order value so a card lands at the end of its slot's stack. */
+async function nextOrderInSlot(
+  ctx: MutationCtx,
+  chapterId: Id<"chapters">,
+  columnId: Id<"plotColumns">,
+) {
+  const inSlot = await ctx.db
+    .query("cells")
+    .withIndex("by_chapter_column", (q) =>
+      q.eq("chapterId", chapterId).eq("columnId", columnId),
+    )
+    .collect();
+  if (inSlot.length === 0) return 0;
+  return Math.max(...inSlot.map((c) => c.order ?? 0)) + 1;
+}
+
+/** Create a card in a slot and return its id (used by the “+ card” button). */
+export const addCard = mutation({
   args: {
     boardId: v.id("boards"),
     chapterId: v.id("chapters"),
     columnId: v.id("plotColumns"),
-    content: v.string(),
+    content: v.optional(v.string()),
   },
   handler: async (ctx, { boardId, chapterId, columnId, content }) => {
     await requireBoard(ctx, boardId);
-    const existing = await ctx.db
-      .query("cells")
-      .withIndex("by_chapter_column", (q) =>
-        q.eq("chapterId", chapterId).eq("columnId", columnId),
-      )
-      .unique();
-
-    const text = content.trim();
-    if (!text) {
-      if (existing) await ctx.db.delete(existing._id);
-      return;
-    }
-    if (existing) {
-      await ctx.db.patch(existing._id, { content: text });
-    } else {
-      await ctx.db.insert("cells", {
-        boardId,
-        chapterId,
-        columnId,
-        content: text,
-      });
-    }
+    return await ctx.db.insert("cells", {
+      boardId,
+      chapterId,
+      columnId,
+      content: content?.trim() ?? "",
+      order: await nextOrderInSlot(ctx, chapterId, columnId),
+    });
   },
 });
 
 /**
- * Drag-and-drop: move a card from one grid position to another.
- * If the target already holds a card, the two swap places so no writing
- * is ever silently destroyed.
+ * Update one card's text. Never deletes: an emptied card is only removed when
+ * the editor closes on it (see deleteCard), so mid-edit clears stay safe.
  */
-export const moveCell = mutation({
+export const setCard = mutation({
+  args: { cardId: v.id("cells"), content: v.string() },
+  handler: async (ctx, { cardId, content }) => {
+    const card = await ctx.db.get(cardId);
+    if (!card) return;
+    await requireBoard(ctx, card.boardId);
+    await ctx.db.patch(cardId, { content });
+  },
+});
+
+/** Remove a single card (editor closed on empty text, or explicit remove). */
+export const deleteCard = mutation({
+  args: { cardId: v.id("cells") },
+  handler: async (ctx, { cardId }) => {
+    const card = await ctx.db.get(cardId);
+    if (!card) return;
+    await requireBoard(ctx, card.boardId);
+    await ctx.db.delete(cardId);
+  },
+});
+
+/**
+ * Drag-and-drop: move a card into another slot, appended after whatever
+ * already sits there — slots stack multiple cards and nothing is overwritten.
+ */
+export const moveCard = mutation({
   args: {
-    boardId: v.id("boards"),
-    fromChapterId: v.id("chapters"),
-    fromColumnId: v.id("plotColumns"),
+    cardId: v.id("cells"),
     toChapterId: v.id("chapters"),
     toColumnId: v.id("plotColumns"),
   },
-  handler: async (ctx, args) => {
-    await requireBoard(ctx, args.boardId);
-    const { fromChapterId, fromColumnId, toChapterId, toColumnId, boardId } =
-      args;
-    if (fromChapterId === toChapterId && fromColumnId === toColumnId) return;
+  handler: async (ctx, { cardId, toChapterId, toColumnId }) => {
+    const card = await ctx.db.get(cardId);
+    if (!card) return;
+    const board = await requireBoard(ctx, card.boardId);
 
-    const [source, target] = await Promise.all([
-      ctx.db
-        .query("cells")
-        .withIndex("by_chapter_column", (q) =>
-          q.eq("chapterId", fromChapterId).eq("columnId", fromColumnId),
-        )
-        .unique(),
-      ctx.db
-        .query("cells")
-        .withIndex("by_chapter_column", (q) =>
-          q.eq("chapterId", toChapterId).eq("columnId", toColumnId),
-        )
-        .unique(),
+    const [chapter, column] = await Promise.all([
+      ctx.db.get(toChapterId),
+      ctx.db.get(toColumnId),
     ]);
-    if (!source) return; // nothing to move
+    if (!chapter || chapter.boardId !== board._id)
+      throw new Error("Bad chapter");
+    if (!column || column.boardId !== board._id) throw new Error("Bad column");
 
-    const sourceText = source.content;
-    const targetText = target?.content ?? "";
+    if (card.chapterId === toChapterId && card.columnId === toColumnId) return;
 
-    if (target) {
-      await ctx.db.patch(target._id, { content: sourceText });
-      if (targetText.trim()) {
-        await ctx.db.patch(source._id, { content: targetText });
-      } else {
-        await ctx.db.delete(source._id);
-      }
-    } else {
-      await ctx.db.patch(source._id, {
-        chapterId: toChapterId,
-        columnId: toColumnId,
-        boardId,
-      });
-    }
+    await ctx.db.patch(cardId, {
+      chapterId: toChapterId,
+      columnId: toColumnId,
+      order: await nextOrderInSlot(ctx, toChapterId, toColumnId),
+    });
   },
 });

@@ -33,15 +33,19 @@ import {
   Trash2,
 } from "lucide-react";
 
+export type CardInSlot = { id: Id<"cells">; content: string };
+
 export type BoardData = {
   boardId: Id<"boards">;
   title: string;
   chapters: { id: Id<"chapters">; title: string }[];
   columns: { id: Id<"plotColumns">; title: string }[];
-  cells: Record<string, string>;
+  /** Slot key → cards in that slot, in display order (slots stack). */
+  cells: Record<string, CardInSlot[]>;
 };
 
 type CellRef = { chapterId: Id<"chapters">; columnId: Id<"plotColumns"> };
+type DragRef = CellRef & { cardId: Id<"cells"> };
 
 const cellKey = (chapterId: string, columnId: string) =>
   `${chapterId}:${columnId}`;
@@ -59,17 +63,19 @@ export function PlotGrid({ data }: { data: BoardData }) {
   const insertColumn = useMutation(api.plot.insertColumn);
   const renameColumn = useMutation(api.plot.renameColumn);
   const deleteColumn = useMutation(api.plot.deleteColumn);
-  const setCell = useMutation(api.plot.setCell);
-  const moveCell = useMutation(api.plot.moveCell);
+  const addCard = useMutation(api.plot.addCard);
+  const setCard = useMutation(api.plot.setCard);
+  const deleteCard = useMutation(api.plot.deleteCard);
+  const moveCard = useMutation(api.plot.moveCard);
 
   const [editing, setEditing] = useState<
-    (CellRef & { chapterTitle: string; columnTitle: string }) | null
+    (DragRef & { chapterTitle: string; columnTitle: string }) | null
   >(null);
-  const [dragging, setDragging] = useState<CellRef | null>(null);
+  const [dragging, setDragging] = useState<DragRef | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   // State updates from dragstart are async; a ref guarantees dragover/drop
   // handlers see the drag as active on their very first invocation.
-  const draggingRef = useRef<CellRef | null>(null);
+  const draggingRef = useRef<DragRef | null>(null);
   const [pendingDelete, setPendingDelete] = useState<
     | {
         kind: "chapter";
@@ -86,22 +92,48 @@ export function PlotGrid({ data }: { data: BoardData }) {
     | null
   >(null);
   const dragStartedAt = useRef(0);
+  // Latest editor text for the card being edited (see saveCard).
+  const lastTextRef = useRef("");
+  // Element that started the current/last drag, to swallow its trailing click.
+  const draggedElRef = useRef<HTMLElement | null>(null);
 
   const openCell = (
+    ref: DragRef,
+    chapterTitle: string,
+    columnTitle: string,
+  ) => {
+    lastTextRef.current =
+      cells[cellKey(ref.chapterId, ref.columnId)]?.find(
+        (card) => card.id === ref.cardId,
+      )?.content ?? "";
+    setEditing({ ...ref, chapterTitle, columnTitle });
+  };
+
+  /** Start a new card in a slot and open it for writing. */
+  const startCard = (
     ref: CellRef,
     chapterTitle: string,
     columnTitle: string,
   ) => {
-    setEditing({ ...ref, chapterTitle, columnTitle });
+    lastTextRef.current = "";
+    addCard({ boardId, chapterId: ref.chapterId, columnId: ref.columnId }).then(
+      (cardId) => setEditing({ ...ref, cardId, chapterTitle, columnTitle }),
+      () => toast.error("Couldn't add a card"),
+    );
   };
 
-  const saveCell = (ref: CellRef, text: string) => {
-    setCell({
-      boardId,
-      chapterId: ref.chapterId,
-      columnId: ref.columnId,
-      content: text,
-    }).catch(() => toast.error("Couldn't save that card"));
+  /**
+   * Write-through from the editor. Tracks the latest text so the close handler
+   * can tell whether the card ended up empty — mid-edit clears are never
+   * deletes, only closing on an empty card is.
+   */
+  const saveCard = (text: string) => {
+    lastTextRef.current = text;
+    if (!editing) return;
+    run(
+      setCard({ cardId: editing.cardId, content: text }),
+      "Couldn't save that card",
+    );
   };
 
   const handleDrop = (target: CellRef) => {
@@ -115,14 +147,14 @@ export function PlotGrid({ data }: { data: BoardData }) {
       source.columnId === target.columnId
     )
       return;
-    moveCell({
-      boardId,
-      fromChapterId: source.chapterId,
-      fromColumnId: source.columnId,
+    // The card is appended after whatever already sits in the target slot —
+    // slots stack cards; nothing is swapped or overwritten.
+    moveCard({
+      cardId: source.cardId,
       toChapterId: target.chapterId,
       toColumnId: target.columnId,
     }).then(
-      () => toast.success("Card moved"),
+      () => toast.success("Card stacked into that slot"),
       () => toast.error("Couldn't move that card"),
     );
   };
@@ -202,9 +234,12 @@ export function PlotGrid({ data }: { data: BoardData }) {
                           kind: "column",
                           columnId: column.id,
                           title: column.title,
-                          cards: chapters.filter((ch) =>
-                            cells[cellKey(ch.id, column.id)]?.trim(),
-                          ).length,
+                          cards: chapters.reduce(
+                            (total, ch) =>
+                              total +
+                              (cells[cellKey(ch.id, column.id)]?.length ?? 0),
+                            0,
+                          ),
                         })
                       }
                     >
@@ -305,9 +340,12 @@ export function PlotGrid({ data }: { data: BoardData }) {
                           kind: "chapter",
                           chapterId: chapter.id,
                           title: chapter.title,
-                          cards: columns.filter((col) =>
-                            cells[cellKey(chapter.id, col.id)]?.trim(),
-                          ).length,
+                          cards: columns.reduce(
+                            (total, col) =>
+                              total +
+                              (cells[cellKey(chapter.id, col.id)]?.length ?? 0),
+                            0,
+                          ),
                         })
                       }
                     >
@@ -318,15 +356,11 @@ export function PlotGrid({ data }: { data: BoardData }) {
                 </DropdownMenu>
               </div>
 
-              {/* Cards */}
+              {/* Cards — a slot is a stack: add or drop as many as you like */}
               {columns.map((column) => {
                 const key = cellKey(chapter.id, column.id);
-                const content = cells[key] ?? "";
-                const isDragging =
-                  dragging?.chapterId === chapter.id &&
-                  dragging?.columnId === column.id;
+                const cards = cells[key] ?? [];
                 const isTarget = dropTarget === key;
-                const filled = content.trim().length > 0;
 
                 return (
                   <div
@@ -348,76 +382,121 @@ export function PlotGrid({ data }: { data: BoardData }) {
                       });
                     }}
                     className={cn(
-                      "border-b border-r border-border/70 p-2 transition-colors",
+                      "flex flex-col gap-2 border-b border-r border-border/70 p-2 transition-colors",
                       rowIndex % 2 === 1 && "bg-abyss/25",
                       isTarget && "bg-gilt/10",
                     )}
                   >
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      draggable
-                      onDragStart={(event) => {
-                        const ref = {
-                          chapterId: chapter.id,
-                          columnId: column.id,
-                        };
-                        dragStartedAt.current = Date.now();
-                        draggingRef.current = ref;
-                        setDragging(ref);
-                        event.dataTransfer.effectAllowed = "move";
-                        event.dataTransfer.setData(
-                          "text/plain",
-                          `${chapter.title} · ${column.title}`,
-                        );
-                      }}
-                      onDragEnd={() => {
-                        draggingRef.current = null;
-                        setDragging(null);
-                        setDropTarget(null);
-                        // Restart the guard window so the click some browsers
-                        // fire right after a drop doesn't reopen the card.
-                        dragStartedAt.current = Date.now();
-                      }}
-                      onClick={() => {
-                        // Some browsers fire a click right after a drag; ignore it.
-                        if (draggingRef.current) return;
-                        if (Date.now() - dragStartedAt.current < 350) return;
-                        openCell(
+                    {cards.map((card) => {
+                      const isDragging = dragging?.cardId === card.id;
+                      const filled = card.content.trim().length > 0;
+
+                      return (
+                        <div
+                          key={card.id}
+                          role="button"
+                          tabIndex={0}
+                          draggable
+                          onDragStart={(event) => {
+                            const ref = {
+                              cardId: card.id,
+                              chapterId: chapter.id,
+                              columnId: column.id,
+                            };
+                            dragStartedAt.current = Date.now();
+                            draggedElRef.current = event.currentTarget;
+                            draggingRef.current = ref;
+                            setDragging(ref);
+                            event.dataTransfer.effectAllowed = "move";
+                            event.dataTransfer.setData(
+                              "text/plain",
+                              `${chapter.title} · ${column.title}`,
+                            );
+                          }}
+                          onDragEnd={() => {
+                            draggingRef.current = null;
+                            setDragging(null);
+                            setDropTarget(null);
+                            // Restart the guard window so the click some browsers
+                            // fire right after a drop doesn't reopen the card.
+                            dragStartedAt.current = Date.now();
+                          }}
+                          onClick={(event) => {
+                            // Some browsers fire a click right after a drag;
+                            // ignore only that one, on the dragged card itself.
+                            if (draggingRef.current) return;
+                            if (
+                              draggedElRef.current === event.currentTarget &&
+                              Date.now() - dragStartedAt.current < 350
+                            ) {
+                              draggedElRef.current = null;
+                              return;
+                            }
+                            openCell(
+                              {
+                                cardId: card.id,
+                                chapterId: chapter.id,
+                                columnId: column.id,
+                              },
+                              chapter.title,
+                              column.title,
+                            );
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              openCell(
+                                {
+                                  cardId: card.id,
+                                  chapterId: chapter.id,
+                                  columnId: column.id,
+                                },
+                                chapter.title,
+                                column.title,
+                              );
+                            }
+                          }}
+                          className={cn(
+                            "group/card relative flex min-h-[92px] w-full cursor-grab flex-col rounded-lg border bg-abyss/50 p-3 text-left transition-all active:cursor-grabbing",
+                            isDragging && "opacity-40",
+                            "border-border/60 hover:border-gilt/50 hover:bg-abyss",
+                          )}
+                        >
+                          <GripVertical className="absolute right-2 top-2 size-3.5 text-ash/40 opacity-0 transition-opacity group-hover/card:opacity-100" />
+                          {filled ? (
+                            <p className="line-clamp-4 whitespace-pre-wrap font-serif text-[15px] leading-6 text-vellum/90">
+                              {card.content}
+                            </p>
+                          ) : (
+                            <span className="label-caps mt-auto text-gilt/70">
+                              writing…
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+
+                    {/* Add another card to this slot */}
+                    <button
+                      type="button"
+                      aria-label={`Add a card to ${chapter.title} · ${column.title}`}
+                      onClick={() =>
+                        startCard(
                           { chapterId: chapter.id, columnId: column.id },
                           chapter.title,
                           column.title,
-                        );
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          openCell(
-                            { chapterId: chapter.id, columnId: column.id },
-                            chapter.title,
-                            column.title,
-                          );
-                        }
-                      }}
+                        )
+                      }
                       className={cn(
-                        "group/card relative flex min-h-[104px] w-full cursor-grab flex-col rounded-lg border bg-abyss/50 p-3 text-left transition-all active:cursor-grabbing",
-                        isDragging && "opacity-40",
-                        isTarget
-                          ? "border-gilt/70 bg-gilt/10 shadow-[0_0_0_1px_rgba(0,0,0,0)]"
-                          : "border-border/60 hover:border-gilt/50 hover:bg-abyss",
+                        "label-caps flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed py-2 transition-colors",
+                        cards.length === 0
+                          ? "min-h-[92px] border-border/60 text-ash/50 hover:border-gilt/60 hover:text-gilt"
+                          : "border-border/50 text-ash/50 hover:border-gilt/60 hover:text-gilt",
                       )}
                     >
-                      <GripVertical className="absolute right-2 top-2 size-3.5 text-ash/40 opacity-0 transition-opacity group-hover/card:opacity-100" />
-                      {filled ? (
-                        <p className="line-clamp-4 whitespace-pre-wrap font-serif text-[15px] leading-6 text-vellum/90">
-                          {content}
-                        </p>
-                      ) : (
-                        <span className="label-caps mt-auto text-ash/50 group-hover/card:text-gilt/70">
-                          + card
-                        </span>
-                      )}
-                    </div>
+                      <Plus className="size-3" />
+                      {cards.length === 0 ? "card" : "another card"}
+                    </button>
                   </div>
                 );
               })}
@@ -451,7 +530,8 @@ export function PlotGrid({ data }: { data: BoardData }) {
             style={{ gridColumn: `span ${columns.length + 1}` }}
           >
             <p className="label-caps text-ash/50">
-              drag a card onto another to move it · click a card to write
+              drag a card into any slot to stack it · click a card to write · +
+              to add another
             </p>
           </div>
         </div>
@@ -506,18 +586,24 @@ export function PlotGrid({ data }: { data: BoardData }) {
       <CellEditor
         open={editing !== null}
         onOpenChange={(open) => {
-          if (!open) setEditing(null);
+          if (open) return;
+          // Closing on an empty card removes it instead of leaving a blank
+          // placeholder in the stack.
+          if (editing && !lastTextRef.current.trim()) {
+            run(deleteCard({ cardId: editing.cardId }), "Couldn't remove card");
+          }
+          setEditing(null);
         }}
         chapterTitle={editing?.chapterTitle ?? ""}
         columnTitle={editing?.columnTitle ?? ""}
         value={
           editing
-            ? (cells[cellKey(editing.chapterId, editing.columnId)] ?? "")
+            ? (cells[cellKey(editing.chapterId, editing.columnId)]?.find(
+                (card) => card.id === editing.cardId,
+              )?.content ?? "")
             : ""
         }
-        onSave={(text) => {
-          if (editing) saveCell(editing, text);
-        }}
+        onSave={saveCard}
       />
     </div>
   );
