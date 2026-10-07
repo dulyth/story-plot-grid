@@ -32,12 +32,33 @@ const schema = defineSchema(
       role: v.optional(roleValidator), // role of the user. do not remove
     }).index("email", ["email"]), // index for the email. do not remove or modify
 
-    // add other tables here
+    // One plot grid per author: chapters (rows) x layers (columns) x cards (cells).
+    boards: defineTable({
+      ownerId: v.id("users"),
+      title: v.string(),
+      createdAt: v.number(),
+    }).index("by_owner", ["ownerId"]),
 
-    // tableName: defineTable({
-    //   ...
-    //   // table fields
-    // }).index("by_field", ["field"])
+    chapters: defineTable({
+      boardId: v.id("boards"),
+      title: v.string(),
+      order: v.number(),
+    }).index("by_board", ["boardId"]),
+
+    plotColumns: defineTable({
+      boardId: v.id("boards"),
+      title: v.string(),
+      order: v.number(),
+    }).index("by_board", ["boardId"]),
+
+    cells: defineTable({
+      boardId: v.id("boards"),
+      chapterId: v.id("chapters"),
+      columnId: v.id("plotColumns"),
+      content: v.string(),
+    })
+      .index("by_chapter_column", ["chapterId", "columnId"])
+      .index("by_board", ["boardId"]),
   },
   {
     schemaValidation: false,
