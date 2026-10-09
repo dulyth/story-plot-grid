@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/convex/_generated/api";
+import type { Id } from "@/convex/_generated/dataModel";
 import { useMutation, useQuery } from "convex/react";
 import { useAuth } from "@/hooks/use-auth";
 import { LogoDropdown } from "@/components/LogoDropdown";
@@ -10,23 +11,69 @@ import { useNavigate } from "react-router";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
+/** localStorage key remembering this device's board across sessions. */
+const BOARD_MARKER = "plotgrid:board";
+
 export default function Dashboard() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
   const board = useQuery(api.plot.getBoard);
   const ensureBoard = useMutation(api.plot.ensureBoard);
+  const claimBoard = useMutation(api.plot.claimBoard);
   const renameBoard = useMutation(api.plot.renameBoard);
   const bootstrapped = useRef(false);
+  const [bootAttempt, setBootAttempt] = useState(0);
+  const [bootError, setBootError] = useState(false);
 
-  // Create the starter grid (Chapter 1 x four layers) on first visit.
+  // Persist a marker so a board written before signing in (guest session)
+  // can be claimed back after login instead of starting over.
   useEffect(() => {
-    if (board === null && !bootstrapped.current) {
-      bootstrapped.current = true;
-      ensureBoard({}).catch(() =>
-        toast.error("Couldn't create your plot grid"),
-      );
+    if (board) {
+      try {
+        localStorage.setItem(BOARD_MARKER, board.boardId);
+      } catch {
+        // Storage unavailable (private mode) — nothing to restore later.
+      }
     }
-  }, [board, ensureBoard]);
+  }, [board]);
+
+  // First visit for this account: try to reclaim a board remembered on this
+  // device, otherwise create the starter grid (Chapter 1 x four layers).
+  useEffect(() => {
+    if (board !== null || bootstrapped.current) return;
+    bootstrapped.current = true;
+    setBootError(false);
+
+    let claimed: string | null = null;
+    try {
+      claimed = localStorage.getItem(BOARD_MARKER);
+    } catch {
+      claimed = null;
+    }
+    // Wrapped so even a synchronously-rejected malformed id is caught; a bad
+    // marker then falls back to a fresh grid, while a network failure in
+    // ensureBoard below still lands on the retry screen.
+    const restore = claimed
+      ? Promise.resolve()
+          .then(() => claimBoard({ boardId: claimed as Id<"boards"> }))
+          .catch(() => null)
+      : Promise.resolve(null);
+
+    restore
+      .then(async (restoredId) => {
+        if (restoredId) {
+          toast.success("Welcome back — your grid was restored");
+          return;
+        }
+        await ensureBoard({});
+      })
+      .catch(() => {
+        // Network hiccup: allow a retry instead of an endless spinner.
+        bootstrapped.current = false;
+        setBootError(true);
+        toast.error("Couldn't open your plot grid");
+      });
+  }, [board, bootAttempt, claimBoard, ensureBoard]);
 
   const handleSignOut = async () => {
     await signOut();
@@ -36,10 +83,31 @@ export default function Dashboard() {
   if (!board) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-4">
-          <Loader2 className="size-6 animate-spin text-gilt" />
-          <p className="label-caps text-ash">Opening your codex</p>
-        </div>
+        {bootError ? (
+          <div className="flex flex-col items-center gap-4 text-center">
+            <p className="font-display text-xl text-vellum">
+              Couldn&rs;t open your grid
+            </p>
+            <p className="max-w-sm text-[15px] leading-6 text-ash">
+              Your work is safe — check your connection and try again.
+            </p>
+            <Button
+              type="button"
+              className="cursor-pointer gap-2 bg-gilt text-void hover:bg-gilt/90"
+              onClick={() => {
+                setBootError(false);
+                setBootAttempt((n) => n + 1);
+              }}
+            >
+              Try again
+            </Button>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-4">
+            <Loader2 className="size-6 animate-spin text-gilt" />
+            <p className="label-caps text-ash">Opening your codex</p>
+          </div>
+        )}
       </main>
     );
   }

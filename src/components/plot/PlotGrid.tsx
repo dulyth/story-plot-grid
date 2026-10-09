@@ -26,6 +26,8 @@ import { CellEditor } from "./CellEditor";
 import {
   ArrowDownToLine,
   ArrowUpToLine,
+  ChevronDown,
+  ChevronUp,
   GripVertical,
   MoreHorizontal,
   Pencil,
@@ -73,6 +75,12 @@ export function PlotGrid({ data }: { data: BoardData }) {
   >(null);
   const [dragging, setDragging] = useState<DragRef | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  // Where a card would land if dropped right now: insertion bar visuals.
+  const [insertPoint, setInsertPoint] = useState<{
+    key: string;
+    cardId: Id<"cells">;
+    edge: "top" | "bottom";
+  } | null>(null);
   // State updates from dragstart are async; a ref guarantees dragover/drop
   // handlers see the drag as active on their very first invocation.
   const draggingRef = useRef<DragRef | null>(null);
@@ -136,26 +144,95 @@ export function PlotGrid({ data }: { data: BoardData }) {
     );
   };
 
-  const handleDrop = (target: CellRef) => {
-    const source = draggingRef.current;
+  const clearDragUi = () => {
     draggingRef.current = null;
     setDragging(null);
     setDropTarget(null);
+    setInsertPoint(null);
+  };
+
+  /**
+   * Resolve a drop on (or between) cards to a concrete index.
+   *
+   * `toIndex` is the card's final index among the other cards of that slot —
+   * exactly what the backend splices into — so it works for moving between
+   * cells (append/reference-relative) and reordering inside one cell alike.
+   */
+  const resolveDrop = (
+    source: DragRef,
+    target: CellRef,
+    referenceCardId: Id<"cells"> | null,
+    edge: "top" | "bottom",
+  ): number | undefined => {
+    const list = cells[cellKey(target.chapterId, target.columnId)] ?? [];
+    const sameSlot =
+      source.chapterId === target.chapterId &&
+      source.columnId === target.columnId;
+
+    if (referenceCardId === null) {
+      // Dropped on the cell's empty background: append across cells, but a
+      // same-slot background drop is a no-op so a stray drop can't reshuffle.
+      return sameSlot ? undefined : list.length;
+    }
+
+    const from = sameSlot
+      ? list.findIndex((c) => c.id === source.cardId)
+      : -1;
+    const referenceIndex = list.findIndex((c) => c.id === referenceCardId);
+    if (referenceIndex === -1) return list.length;
+
+    let toIndex = referenceIndex + (edge === "bottom" ? 1 : 0);
+    // Removing the dragged card shifts later positions down by one.
+    if (from !== -1 && toIndex > from) toIndex -= 1;
+    return toIndex;
+  };
+
+  const handleDrop = (
+    target: CellRef,
+    referenceCardId: Id<"cells"> | null = null,
+    edge: "top" | "bottom" = "top",
+  ) => {
+    const source = draggingRef.current;
+    clearDragUi();
     if (!source) return;
+
+    const toIndex = resolveDrop(source, target, referenceCardId, edge);
     if (
       source.chapterId === target.chapterId &&
-      source.columnId === target.columnId
+      source.columnId === target.columnId &&
+      toIndex === undefined
     )
       return;
-    // The card is appended after whatever already sits in the target slot —
+
+    const sameSlot =
+      source.chapterId === target.chapterId &&
+      source.columnId === target.columnId;
+    // The card lands inside the target slot's stack at the chosen position —
     // slots stack cards; nothing is swapped or overwritten.
     moveCard({
       cardId: source.cardId,
       toChapterId: target.chapterId,
       toColumnId: target.columnId,
+      ...(toIndex === undefined ? {} : { toIndex }),
     }).then(
-      () => toast.success("Card stacked into that slot"),
+      () => toast.success(sameSlot ? "Card reordered" : "Card stacked into that slot"),
       () => toast.error("Couldn't move that card"),
+    );
+  };
+
+  /** Move a card one place up/down inside its own cell. */
+  const nudgeCard = (card: CardInSlot, index: number, delta: -1 | 1, slot: CellRef) => {
+    const list = cells[cellKey(slot.chapterId, slot.columnId)] ?? [];
+    const toIndex = Math.max(0, Math.min(index + delta, list.length - 1));
+    if (toIndex === index) return;
+    run(
+      moveCard({
+        cardId: card.id,
+        toChapterId: slot.chapterId,
+        toColumnId: slot.columnId,
+        toIndex,
+      }),
+      "Couldn't reorder card",
     );
   };
 
@@ -376,6 +453,7 @@ export function PlotGrid({ data }: { data: BoardData }) {
                     }}
                     onDrop={(event) => {
                       event.preventDefault();
+                      // Dropped on the cell background (not on a card): append.
                       handleDrop({
                         chapterId: chapter.id,
                         columnId: column.id,
@@ -387,13 +465,75 @@ export function PlotGrid({ data }: { data: BoardData }) {
                       isTarget && "bg-gilt/10",
                     )}
                   >
-                    {cards.map((card) => {
+                    {cards.map((card, cardIndex) => {
                       const isDragging = dragging?.cardId === card.id;
                       const filled = card.content.trim().length > 0;
+                      const isInsertHere =
+                        insertPoint?.key === key &&
+                        insertPoint.cardId === card.id;
+                      const markerEdge = isInsertHere
+                        ? insertPoint.edge
+                        : null;
 
                       return (
                         <div
                           key={card.id}
+                          className="relative"
+                          onDragOver={(event) => {
+                            if (!draggingRef.current) return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            event.dataTransfer.dropEffect = "move";
+                            const rect =
+                              event.currentTarget.getBoundingClientRect();
+                            const edge =
+                              event.clientY < rect.top + rect.height / 2
+                                ? "top"
+                                : "bottom";
+                            if (
+                              insertPoint?.cardId !== card.id ||
+                              insertPoint.edge !== edge
+                            ) {
+                              setInsertPoint({
+                                key,
+                                cardId: card.id,
+                                edge,
+                              });
+                            }
+                          }}
+                          onDrop={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            const rect =
+                              event.currentTarget.getBoundingClientRect();
+                            const edge =
+                              event.clientY < rect.top + rect.height / 2
+                                ? "top"
+                                : "bottom";
+                            handleDrop(
+                              {
+                                chapterId: chapter.id,
+                                columnId: column.id,
+                              },
+                              card.id,
+                              edge,
+                            );
+                          }}
+                        >
+                          {/* Insertion bar: where the card would land */}
+                          {markerEdge === "top" && (
+                            <span
+                              aria-hidden
+                              className="absolute -top-[5px] left-0 right-0 z-10 h-[3px] rounded-full bg-gilt shadow-[0_0_6px_oklch(0.785_0.132_78/0.7)]"
+                            />
+                          )}
+                          {markerEdge === "bottom" && (
+                            <span
+                              aria-hidden
+                              className="absolute -bottom-[5px] left-0 right-0 z-10 h-[3px] rounded-full bg-gilt shadow-[0_0_6px_oklch(0.785_0.132_78/0.7)]"
+                            />
+                          )}
+                        <div
                           role="button"
                           tabIndex={0}
                           draggable
@@ -414,9 +554,7 @@ export function PlotGrid({ data }: { data: BoardData }) {
                             );
                           }}
                           onDragEnd={() => {
-                            draggingRef.current = null;
-                            setDragging(null);
-                            setDropTarget(null);
+                            clearDragUi();
                             // Restart the guard window so the click some browsers
                             // fire right after a drop doesn't reopen the card.
                             dragStartedAt.current = Date.now();
@@ -472,6 +610,44 @@ export function PlotGrid({ data }: { data: BoardData }) {
                               writing…
                             </span>
                           )}
+                          {/* In-cell reorder (shown once a cell stacks) */}
+                          {cards.length > 1 && (
+                            <div className="absolute left-1.5 top-1.5 flex flex-col gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/card:opacity-100">
+                              <button
+                                type="button"
+                                aria-label={`Move card up in ${chapter.title} · ${column.title}`}
+                                disabled={cardIndex === 0}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  nudgeCard(card, cardIndex, -1, {
+                                    chapterId: chapter.id,
+                                    columnId: column.id,
+                                  });
+                                }}
+                                onKeyDown={(event) => event.stopPropagation()}
+                                className="flex size-4 items-center justify-center rounded-sm border border-border/60 bg-void/80 text-ash transition-colors hover:border-gilt/60 hover:text-gilt disabled:opacity-25 disabled:hover:border-border/60 disabled:hover:text-ash"
+                              >
+                                <ChevronUp className="size-3" />
+                              </button>
+                              <button
+                                type="button"
+                                aria-label={`Move card down in ${chapter.title} · ${column.title}`}
+                                disabled={cardIndex === cards.length - 1}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  nudgeCard(card, cardIndex, 1, {
+                                    chapterId: chapter.id,
+                                    columnId: column.id,
+                                  });
+                                }}
+                                onKeyDown={(event) => event.stopPropagation()}
+                                className="flex size-4 items-center justify-center rounded-sm border border-border/60 bg-void/80 text-ash transition-colors hover:border-gilt/60 hover:text-gilt disabled:opacity-25 disabled:hover:border-border/60 disabled:hover:text-ash"
+                              >
+                                <ChevronDown className="size-3" />
+                              </button>
+                            </div>
+                          )}
+                        </div>
                         </div>
                       );
                     })}

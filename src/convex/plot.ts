@@ -80,13 +80,8 @@ export const getBoard = query({
 
     chapters.sort((a, b) => a.order - b.order);
     plotColumns.sort((a, b) => a.order - b.order);
-    // Cards group into their slot, ordered within it. Legacy cards without an
-    // `order` fall back to 0 and keep creation order via the _creationTime
-    // tiebreak in the sort.
-    cells.sort(
-      (a, b) =>
-        (a.order ?? 0) - (b.order ?? 0) || a._creationTime - b._creationTime,
-    );
+    // Cards group into their slot, ordered within it.
+    cells.sort(bySlotPosition);
 
     const cellMap: Record<string, { id: Id<"cells">; content: string }[]> = {};
     for (const cell of cells) {
@@ -296,6 +291,14 @@ async function nextOrderInSlot(
   return Math.max(...inSlot.map((c) => c.order ?? 0)) + 1;
 }
 
+/** Cards of one slot, ordered (legacy cards without `order` keep creation order). */
+function bySlotPosition(
+  a: { order?: number; _creationTime: number },
+  b: { order?: number; _creationTime: number },
+) {
+  return (a.order ?? 0) - (b.order ?? 0) || a._creationTime - b._creationTime;
+}
+
 /** Create a card in a slot and return its id (used by the “+ card” button). */
 export const addCard = mutation({
   args: {
@@ -342,16 +345,19 @@ export const deleteCard = mutation({
 });
 
 /**
- * Drag-and-drop: move a card into another slot, appended after whatever
- * already sits there — slots stack multiple cards and nothing is overwritten.
+ * Move a card into a slot at an explicit position: `toIndex` is the card's
+ * final index among the *other* cards already there (omit to append).
+ * Dropping onto a populated cell stacks; reordering within a cell just
+ * passes the same chapter/column with a new index. Nothing is overwritten.
  */
 export const moveCard = mutation({
   args: {
     cardId: v.id("cells"),
     toChapterId: v.id("chapters"),
     toColumnId: v.id("plotColumns"),
+    toIndex: v.optional(v.number()),
   },
-  handler: async (ctx, { cardId, toChapterId, toColumnId }) => {
+  handler: async (ctx, { cardId, toChapterId, toColumnId, toIndex }) => {
     const card = await ctx.db.get(cardId);
     if (!card) return;
     const board = await requireBoard(ctx, card.boardId);
@@ -364,12 +370,68 @@ export const moveCard = mutation({
       throw new Error("Bad chapter");
     if (!column || column.boardId !== board._id) throw new Error("Bad column");
 
-    if (card.chapterId === toChapterId && card.columnId === toColumnId) return;
+    const sameSlot =
+      card.chapterId === toChapterId && card.columnId === toColumnId;
+    if (sameSlot && toIndex === undefined) return; // no-op move
 
-    await ctx.db.patch(cardId, {
-      chapterId: toChapterId,
-      columnId: toColumnId,
-      order: await nextOrderInSlot(ctx, toChapterId, toColumnId),
-    });
+    const inSlot = await ctx.db
+      .query("cells")
+      .withIndex("by_chapter_column", (q) =>
+        q.eq("chapterId", toChapterId).eq("columnId", toColumnId),
+      )
+      .collect();
+    const others = inSlot.filter((c) => c._id !== cardId).sort(bySlotPosition);
+    const at =
+      toIndex === undefined
+        ? others.length
+        : Math.max(0, Math.min(Math.round(toIndex), others.length));
+    others.splice(at, 0, card);
+
+    // Renumber the whole slot so order stays dense after any reorder.
+    for (let i = 0; i < others.length; i++) {
+      const entry = others[i];
+      if (entry._id === cardId) {
+        await ctx.db.patch(cardId, {
+          chapterId: toChapterId,
+          columnId: toColumnId,
+          order: i,
+        });
+      } else if (entry.order !== i) {
+        await ctx.db.patch(entry._id, { order: i });
+      }
+    }
+  },
+});
+
+/**
+ * Take over a board remembered on this device (localStorage marker) after
+ * signing in — e.g. a guest grid written before creating an account — so
+ * progress follows the person instead of the session.
+ *
+ * Guard rails: only boards owned by an *anonymous* user can be claimed, and
+ * only by someone who has no board of their own. Registered accounts can
+ * never have their work claimed away, and a marker alone is not enough —
+ * the caller must be signed in.
+ */
+export const claimBoard = mutation({
+  args: { boardId: v.id("boards") },
+  handler: async (ctx, { boardId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+
+    const mine = await ctx.db
+      .query("boards")
+      .withIndex("by_owner", (q) => q.eq("ownerId", userId))
+      .first();
+    if (mine) return mine._id; // they already have a grid — keep it
+
+    const board = await ctx.db.get(boardId);
+    if (!board || board.ownerId === userId) return null;
+
+    const owner = await ctx.db.get(board.ownerId);
+    if (!owner || owner.isAnonymous !== true) return null;
+
+    await ctx.db.patch(boardId, { ownerId: userId });
+    return boardId;
   },
 });
